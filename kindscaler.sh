@@ -1,6 +1,31 @@
 #!/bin/bash
 set -euxo pipefail
 
+# Detect OS and set platform-specific commands
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS - check for GNU sed (gsed) or Homebrew GNU sed
+    if command -v gsed &> /dev/null; then
+        SED_CMD="gsed"
+    elif [[ -x "/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed" ]]; then
+        SED_CMD="/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed"
+    elif [[ -x "/usr/local/opt/gnu-sed/libexec/gnubin/sed" ]]; then
+        SED_CMD="/usr/local/opt/gnu-sed/libexec/gnubin/sed"
+    else
+        echo "GNU sed is required on macOS. Install with: brew install gnu-sed"
+        exit 1
+    fi
+    # macOS random number generation (shuf may not be available)
+    random_port() {
+        jot -r 1 39000 39999
+    }
+else
+    # Linux - use standard sed
+    SED_CMD="sed"
+    random_port() {
+        shuf -i 39000-39999 -n 1
+    }
+fi
+
 # Check for required commands
 if ! command -v kind &> /dev/null; then
     echo "kind command not found, please install kind to use this script."
@@ -44,7 +69,7 @@ highest_index=0
 existing_nodes=$(kind get nodes --name "$CLUSTER_NAME")
 for node in $existing_nodes; do
     if [[ $node == "$CLUSTER_NAME-$ROLE"* ]]; then
-        suffix=$(echo $node | sed -e "s/^$CLUSTER_NAME-$ROLE//")
+        suffix=$(echo $node | $SED_CMD -e "s/^$CLUSTER_NAME-$ROLE//")
         if [[ "$suffix" =~ ^[0-9]+$ ]] && [ "$suffix" -gt "$highest_index" ]; then
             highest_index=$suffix
         fi
@@ -62,12 +87,12 @@ for i in $(seq $start_index $end_index); do
     docker cp $CONTAINER_NAME:/kind/kubeadm.conf kubeadm-$i.conf > /dev/null 2>&1
 
     # Replace the container role name with specific node name in the kubeadm file
-    sed -i "s/$CONTAINER_NAME$/$CONTAINER_NAME$i/g" "./kubeadm-$i.conf"
+    $SED_CMD -i "s/$CONTAINER_NAME$/$CONTAINER_NAME$i/g" "./kubeadm-$i.conf"
 
     # Update IP addresses
     # Assume the file contains parameters 'advertiseAddress' and 'node-ip' with typical IP values
     # Extract the IP address used, increment it, and replace it in the file
-    ORIGINAL_IP=$(grep -oP '(advertiseAddress|node-ip):\s*\K([0-9]{1,3}(\.[0-9]{1,3}){3})' "./kubeadm-$i.conf" | head -1)
+    ORIGINAL_IP=$(awk '/(advertiseAddress|node-ip):/ {print $NF}' "./kubeadm-$i.conf" | head -1)
     IMAGE=$(docker ps | grep $CLUSTER_NAME | awk '{print $2}' | head -1)
     if [ "$ROLE" == "worker" ]; then
     # Command for worker nodes
@@ -80,7 +105,7 @@ for i in $(seq $start_index $end_index); do
         --detach --tty --label io.x-k8s.kind.cluster=$CLUSTER_NAME --net kind \
         --restart=on-failure:1 --init=false $IMAGE > /dev/null 2>&1
         NEW_IP=$(docker inspect $CLUSTER_NAME-$ROLE$i | grep IPAddress | tail -1 | cut -d "\"" -f 4)
-        sed -i -r "s/$ORIGINAL_IP/$NEW_IP/g" "./kubeadm-$i.conf"
+        $SED_CMD -i -r "s/$ORIGINAL_IP/$NEW_IP/g" "./kubeadm-$i.conf"
         sleep 5
         docker cp kubeadm-$i.conf $CLUSTER_NAME-$ROLE$i:/kind/kubeadm.conf > /dev/null 2>&1
         docker exec --privileged $CLUSTER_NAME-$ROLE$i kubeadm join --config /kind/kubeadm.conf --skip-phases=preflight --v=6 > /dev/null 2>&1
@@ -88,7 +113,7 @@ for i in $(seq $start_index $end_index); do
         echo "Done!"
     elif [ "$ROLE" == "control-plane" ]; then
     # Generate a random port number between 36000 and 36999 for control-plane nodes
-        PORT=$(shuf -i 39000-39999 -n 1)   
+        PORT=$(random_port)   
     # Command for control-plane nodes
         echo -n "Adding $CLUSTER_NAME-$ROLE$i node to $CLUSTER_NAME cluster... "
         docker run --name $CLUSTER_NAME-$ROLE$i --hostname $CLUSTER_NAME-$ROLE$i \
@@ -99,7 +124,7 @@ for i in $(seq $start_index $end_index); do
         --detach --tty --label io.x-k8s.kind.cluster=$CLUSTER_NAME --net kind \
         --restart=on-failure:1 --init=false $IMAGE > /dev/null 2>&1
         NEW_IP=$(docker inspect $CLUSTER_NAME-$ROLE$i | grep IPAddress | tail -1 | cut -d "\"" -f 4)
-        sed -i -r "s/$ORIGINAL_IP/$NEW_IP/g" "./kubeadm-$i.conf"
+        $SED_CMD -i -r "s/$ORIGINAL_IP/$NEW_IP/g" "./kubeadm-$i.conf"
         sleep 10
         docker exec --privileged $CLUSTER_NAME-$ROLE$i mkdir /etc/kubernetes/pki/
         docker exec --privileged $CLUSTER_NAME-$ROLE$i mkdir /etc/kubernetes/pki/etcd
